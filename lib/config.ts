@@ -1,0 +1,15 @@
+export const config = {
+  openaiKey: process.env.OPENAI_API_KEY ?? "",
+  openaiModel: process.env.OPENAI_MODEL ?? "gpt-4o",
+  geminiKey: process.env.GEMINI_API_KEY ?? "",
+  model: process.env.GEMINI_MODEL ?? "gemini-2.5-flash",
+  telegramToken: process.env.TELEGRAM_BOT_TOKEN ?? "",
+  saFile: process.env.GOOGLE_SERVICE_ACCOUNT_FILE ?? "service_account.json",
+  saJson: process.env.GOOGLE_SERVICE_ACCOUNT_JSON ?? "",
+  sheetId: process.env.GOOGLE_SHEET_ID ?? "",
+  worksheet: process.env.GOOGLE_WORKSHEET ?? "Sheet1",
+  region: process.env.DEFAULT_PHONE_REGION ?? "SA",
+  dbPath: process.env.DB_PATH ?? "leads.db",
+  accessKey: process.env.APP_ACCESS_KEY ?? "",
+  allowedUsers: (process.env.ALLOWED_USER_IDS ?? "").split(",").map((s) => Number(s.trim())).filter((n) => n > 0),
+};

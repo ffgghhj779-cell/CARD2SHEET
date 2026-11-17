@@ -1,0 +1,11 @@
+node_modules/
+.next/
+out/
+.env
+.env.local
+.env.*.local
+service_account.json
+*.db
+*.db-wal
+*.db-shm
+.DS_Store
