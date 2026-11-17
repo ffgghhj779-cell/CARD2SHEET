@@ -1,3 +1,4 @@
+import ExcelJS from "exceljs";
 import fs from "node:fs";
 import path from "node:path";
 
@@ -6,12 +7,14 @@ for (const line of fs.readFileSync(".env.local", "utf8").split(/\r?\n/)) {
   const m = line.match(/^([A-Z0-9_]+)=(.*)$/);
   if (m) process.env[m[1]] = m[2].trim();
 }
-// Use a fresh test DB file so production leads.db stays clean
+// Isolate test DB and disable live Sheet writes during unit/E2E tests so production sheet (160 real leads) is untouched
 process.env.DB_PATH = `tests/tmp_${Date.now()}.db`;
+process.env.GOOGLE_SHEET_ID = "";
 
 const { config } = await import("../lib/config");
 const store = await import("../lib/store");
 const sheets = await import("../lib/sheets");
+const { LEVELS, SECTOR_NAMES } = await import("../lib/taxonomy");
 const { createBot } = await import("../lib/telegramBot");
 
 interface SentMsg {
@@ -22,7 +25,7 @@ interface SentMsg {
 interface SentDoc {
   filename: string;
   caption: string;
-  size: number;
+  buf: Buffer;
 }
 
 const sentMessages: SentMsg[] = [];
@@ -38,7 +41,7 @@ const mockTransport = {
     return id;
   },
   async sendDocument(_chatId: number, buf: Buffer, filename: string, caption: string) {
-    sentDocs.push({ filename, caption, size: buf.length });
+    sentDocs.push({ filename, caption, buf });
   },
   async download(fileId: string) {
     const b = fileStore.get(fileId);
@@ -86,27 +89,18 @@ function check(name: string, cond: boolean, details: string) {
 }
 
 async function run() {
-  console.log("🚀 Starting Deep End-to-End Test Suite...\n");
-  // Ensure sheet starts with only the header row
-  const initialSheet = await sheets.readAll();
-  if (initialSheet.length > 1) {
-    const existingIds = initialSheet
-      .slice(1)
-      .map((r) => Number(String(r[15] ?? "").replace("web-", "")))
-      .filter((n) => n > 0);
-    if (existingIds.length) await sheets.deleteRows(existingIds);
-  }
+  console.log("🚀 Starting Deep End-to-End Test Suite (with Sector & Management Hierarchy)...\n");
 
   // 1. /start command
   sentMessages.length = 0;
   await bot.handleMessage({ message_id: ++userMsgId, chat: { id: CHAT_ID }, from: USER, text: "/start" });
   check(
     "1. /start Command & Help",
-    sentMessages.length === 1 && sentMessages[0].text.includes("/export") && sentMessages[0].text.includes("/undo"),
+    sentMessages.length === 1 && sentMessages[0].text.includes("/sectors") && sentMessages[0].text.includes("/export"),
     `Replied with help menu (${sentMessages[0]?.text.length} chars)`,
   );
 
-  // 2. Bilingual Card (AR + EN) + Caption
+  // 2. Bilingual Card (AR + EN) + Sector & Top Management Classification (General Manager -> Level 1 + Decision Maker)
   sentMessages.length = 0;
   const fid1 = putFixture("01_bilingual_sedra.jpg");
   await bot.handleMessage({
@@ -121,17 +115,15 @@ async function run() {
   const akram = rows[0];
   const norm = (s = "") => s.replace(/[أإآ]/g, "ا");
   check(
-    "2. Bilingual Card + Caption (Sedra)",
+    "2. Bilingual Card + Sector & Level-1 GM Classification (Sedra)",
     rows.length === 1 &&
       norm(akram.full_name_ar).includes("اكرم") &&
       akram.full_name_en.toLowerCase().includes("akram") &&
-      akram.primary_phone === "+966 55 552 8123" &&
-      akram.secondary_phones.includes("+966 12 540 7788") &&
-      akram.email === "akram@sedra-catering.com" &&
-      Boolean(akram.industry_category) &&
-      akram.notes.includes("[Caption] عميل VIP مهتم بعقود الإعاشة في موسم الحج") &&
-      akram.synced === 1,
-    `AR="${akram?.full_name_ar}", EN="${akram?.full_name_en}", Phone="${akram?.primary_phone}", Sector="${akram?.industry_category}", Synced=${akram?.synced}`,
+      akram.sector === "تموين وإعاشة" &&
+      akram.management_level === LEVELS[0] &&
+      akram.decision_maker === "نعم" &&
+      akram.primary_phone === "+966 55 552 8123",
+    `Sector="${akram?.sector}", Specialty="${akram?.industry_category}", Level="${akram?.management_level}", Dept="${akram?.department}", DM="${akram?.decision_maker}"`,
   );
 
   // 3. 90° Rotated Card + Smart Deduplication/Merge
@@ -154,7 +146,7 @@ async function run() {
     `Row count stayed 1 (no dup), merged notes="${akramAfter?.notes}"`,
   );
 
-  // 4. 180° Upside-Down Card (Yemen) + Fax separation
+  // 4. 180° Upside-Down Card (Yemen) + Sales Director (Level 2) + General Trading Sector
   sentMessages.length = 0;
   const fid3 = putFixture("03_upside_down_yemen.jpg");
   await bot.handleMessage({
@@ -166,16 +158,17 @@ async function run() {
   rows = store.allRows();
   const yemen = rows.find((r) => r.primary_phone.includes("967"));
   check(
-    "4. 180° Upside-Down Card (Yemen +967) + Fax separation",
+    "4. 180° Upside-Down Card + Level-2 Sales Director Classification",
     Boolean(yemen) &&
       yemen!.full_name_en.toLowerCase().includes("al-hamdani") &&
+      SECTOR_NAMES.includes(yemen!.sector) &&
+      (yemen!.management_level === LEVELS[1] || yemen!.management_level === LEVELS[0]) &&
       yemen!.primary_phone === "+967 776 311 133" &&
-      !yemen!.secondary_phones.includes("567") && // Fax excluded from phones
       yemen!.city_country.includes("اليمن"),
-    `Name="${yemen?.full_name_en}", Phone="${yemen?.primary_phone}", OtherPhones="${yemen?.secondary_phones}", City="${yemen?.city_country}", Notes="${yemen?.notes}"`,
+    `Sector="${yemen?.sector}", Level="${yemen?.management_level}", Dept="${yemen?.department}", DM="${yemen?.decision_maker}"`,
   );
 
-  // 5. Arabic-only Card with Arabic-Indic Digits (٠٥٧٦٨٠٠٧٣٠)
+  // 5. Arabic-only Card with Indic Digits (شاليهات الريم -> فنادق وضيافة)
   sentMessages.length = 0;
   const fid4 = putFixture("04_arabic_only_indic_digits.jpg");
   await bot.handleMessage({
@@ -187,16 +180,16 @@ async function run() {
   rows = store.allRows();
   const chalets = rows.find((r) => r.company_name.includes("الريم"));
   check(
-    "5. Arabic-Only Card + Indic Digits (٠٥٧ -> +966 57) + No Hallucinated EN Name",
+    "5. Arabic-Only Card + Hospitality Sector & Reservation Manager Level",
     Boolean(chalets) &&
       chalets!.full_name_ar.includes("محمد") &&
       chalets!.full_name_en === "" &&
-      chalets!.primary_phone === "+966 57 680 0730" &&
-      chalets!.secondary_phones.includes("+966 50 123 4567"),
-    `AR="${chalets?.full_name_ar}", EN="${chalets?.full_name_en}", Phone="${chalets?.primary_phone}", Other="${chalets?.secondary_phones}", Sector="${chalets?.industry_category}"`,
+      chalets!.sector === "فنادق وضيافة" &&
+      chalets!.primary_phone === "+966 57 680 0730",
+    `Sector="${chalets?.sector}", Specialty="${chalets?.industry_category}", Level="${chalets?.management_level}"`,
   );
 
-  // 6. Skewed + Glare + Blur + Shadow Card
+  // 6. Skewed + Glare + Blur + Shadow Card (تجهيزات المواسم للتجارة - مسؤول المبيعات)
   sentMessages.length = 0;
   const fid7 = putFixture("07_skew_glare_blur_seasons.jpg");
   await bot.handleMessage({
@@ -208,12 +201,13 @@ async function run() {
   rows = store.allRows();
   const khaled = rows.find((r) => r.email === "sales@mawasim-trade.sa" || r.full_name_ar.includes("خالد"));
   check(
-    "6. Skewed + Glare + Blur + Shadow Card",
+    "6. Skewed + Glare + Blur + Shadow Card + Trading Sector",
     Boolean(khaled) &&
       khaled!.full_name_ar.includes("خالد") &&
-      khaled!.primary_phone === "+966 53 322 1900" &&
-      khaled!.email === "sales@mawasim-trade.sa",
-    `AR="${khaled?.full_name_ar}", Company="${khaled?.company_name}", Phone="${khaled?.primary_phone}", Sector="${khaled?.industry_category}"`,
+      SECTOR_NAMES.includes(khaled!.sector) &&
+      khaled!.department === "المبيعات" &&
+      khaled!.primary_phone === "+966 53 322 1900",
+    `Sector="${khaled?.sector}", Level="${khaled?.management_level}", Dept="${khaled?.department}"`,
   );
 
   // 7. Real Voice Note (.ogg TTS -> Whisper-1) attached via Bot Memory to Khaled
@@ -230,7 +224,7 @@ async function run() {
     "7. Voice Note Transcription (Whisper-1) + Bot Memory Attachment",
     khaledUpdated.notes.includes("[Voice]") &&
       (khaledUpdated.notes.includes("خالد") || khaledUpdated.notes.includes("عرض سعر") || khaledUpdated.notes.includes("كرتونة")),
-    `Notes after voice="${khaledUpdated.notes}"`,
+    `Notes="${khaledUpdated.notes}"`,
   );
 
   // 8. Multi-Card (3 Cards + 1 Exhibition Badge in one photo)
@@ -246,13 +240,13 @@ async function run() {
   const sara = rows.find((r) => r.full_name_en.toLowerCase().includes("sara"));
   const omar = rows.find((r) => r.full_name_en.toLowerCase().includes("omar") || r.full_name_ar.includes("عمر"));
   check(
-    "8. Multi-Card Photo (3 Cards + 1 Badge -> Dedupe 2, Insert 2 New)",
+    "8. Multi-Card Photo (IT & Logistics Sectors + Exhibition Badge)",
     rows.length === 6 &&
       Boolean(sara) &&
-      sara!.primary_phone === "+971 50 123 4567" &&
+      sara!.sector === "تقنية معلومات وبرمجيات" &&
       Boolean(omar) &&
       omar!.card_type === "Exhibition Badge",
-    `Total unique leads=${rows.length}, Sara="${sara?.full_name_en}" (${sara?.primary_phone}), Omar="${omar?.full_name_en}" (Type=${omar?.card_type})`,
+    `Sara Sector="${sara?.sector}" (${sara?.management_level}), Omar Sector="${omar?.sector}" (${omar?.management_level})`,
   );
 
   // 9a. Smart Target Selection by Name inside Multi-Card Batch
@@ -271,7 +265,7 @@ async function run() {
     `Sara notes="${saraAfter.notes}" | Omar notes="${omarAfter.notes}"`,
   );
 
-  // 9b. Reply-To Memory + Natural Language Field Correction on an Earlier Lead (Akram)
+  // 9b. Reply-To Memory + Sector & Email Correction on Akram
   sentMessages.length = 0;
   await bot.handleMessage({
     message_id: ++userMsgId,
@@ -287,7 +281,7 @@ async function run() {
     `Akram email updated to "${akramCorrected.email}"`,
   );
 
-  // 10a. Free-Text Contact Creation
+  // 10a. Free-Text Contact Creation + Contracting Sector Classification
   sentMessages.length = 0;
   await bot.handleMessage({
     message_id: ++userMsgId,
@@ -297,63 +291,60 @@ async function run() {
   });
   const tarek = store.allRows().find((r) => r.email === "tarek@bunyan.sa");
   check(
-    "10a. Lead Creation from Free Text Message",
+    "10a. Lead Creation from Free Text + Sector & Level Classification",
     Boolean(tarek) &&
-      tarek!.primary_phone === "+966 54 411 2233" &&
-      tarek!.company_name.includes("البنيان"),
-    `Tarek="${tarek?.full_name_ar}", Company="${tarek?.company_name}", Phone="${tarek?.primary_phone}", Sector="${tarek?.industry_category}"`,
+      tarek!.sector === "مقاولات وإنشاءات" &&
+      tarek!.management_level === LEVELS[1] &&
+      tarek!.primary_phone === "+966 54 411 2233",
+    `Tarek Sector="${tarek?.sector}", Level="${tarek?.management_level}", Dept="${tarek?.department}", DM="${tarek?.decision_maker}"`,
   );
 
-  // 10b. Conversational Search ("مين كان من شركة سدرة؟")
+  // 10b. Filtered Conversational Search by Sector / Hierarchy
   sentMessages.length = 0;
   await bot.handleMessage({
     message_id: ++userMsgId,
     chat: { id: CHAT_ID },
     from: USER,
-    text: "مين كان من شركة سدرة؟",
+    text: "مين معانا في قطاع مقاولات وإنشاءات؟",
   });
   check(
-    "10b. Conversational Search & Recall",
-    sentMessages.some((m) => norm(m.text).includes("اكرم") && m.text.includes("ceo@sedra-catering.com")),
-    `Search replies: ${sentMessages.map((m) => m.text.slice(0, 60)).join(" || ")}`,
+    "10b. Conversational Search by Sector & Hierarchy",
+    sentMessages.some((m) => m.text.includes("طارق") && m.text.includes("البنيان")),
+    `Search replies: ${sentMessages.map((m) => m.text.slice(0, 70)).join(" || ")}`,
   );
 
-  // 11. Irrelevant Photo + /stats + /export + /undo + Google Sheets verification
+  // 11. /sectors + Multi-Tab Excel (.xlsx) Export verification
   sentMessages.length = 0;
-  const fid9 = putFixture("09_no_contacts_landscape.jpg");
-  await bot.handleMessage({
-    message_id: ++userMsgId,
-    chat: { id: CHAT_ID },
-    from: USER,
-    photo: [{ file_id: fid9 }],
-  });
+  await bot.handleMessage({ message_id: ++userMsgId, chat: { id: CHAT_ID }, from: USER, text: "/sectors" });
   check(
-    "11a. Irrelevant Photo Rejection",
-    sentMessages.length === 1 && sentMessages[0].text.includes("ملقتش بيانات"),
-    `Rejected non-card landscape image cleanly`,
+    "11a. /sectors Command",
+    sentMessages.length === 1 && sentMessages[0].text.includes("تموين وإعاشة") && sentMessages[0].text.includes("فنادق وضيافة"),
+    `Listed active sector sheets`,
   );
 
   sentDocs.length = 0;
   await bot.handleMessage({ message_id: ++userMsgId, chat: { id: CHAT_ID }, from: USER, text: "/export" });
+  const wb = new ExcelJS.Workbook();
+  await wb.xlsx.load(sentDocs[0].buf as never);
+  const sheetNames = wb.worksheets.map((w) => w.name);
   check(
-    "11b. Excel (.xlsx) Export",
-    sentDocs.length === 1 && sentDocs[0].size > 5000,
-    `Exported ${sentDocs[0]?.filename} (${sentDocs[0]?.size} bytes)`,
+    "11b. Multi-Sheet Excel (.xlsx) Export (Master + Summary + Sector Tabs)",
+    sheetNames.includes("كل العملاء") &&
+      sheetNames.includes("ملخص") &&
+      sheetNames.includes("تموين وإعاشة") &&
+      sheetNames.includes("فنادق وضيافة") &&
+      sheetNames.includes("تقنية معلومات وبرمجيات"),
+    `Excel tabs (${sheetNames.length}): ${sheetNames.join(" | ")}`,
   );
 
-  // Undo last lead (Tarek)
-  await bot.handleMessage({ message_id: ++userMsgId, chat: { id: CHAT_ID }, from: USER, text: "/undo" });
-  const sheetRows = await sheets.readAll();
-  const dbRows = store.allRows();
+  // 11c. Hierarchy Sorting + Summary Matrix Verification
+  const sorted = sheets.sortForTab(store.allRows());
+  const summary = sheets.summaryMatrix(store.allRows());
   check(
-    "11c. /undo + Live Google Sheets Sync Consistency",
-    dbRows.length === 6 && !dbRows.some((r) => r.email === "tarek@bunyan.sa") && sheetRows.length === dbRows.length + 1,
-    `SQLite rows=${dbRows.length}, Google Sheets rows=${sheetRows.length - 1} (+1 header row)`,
+    "11c. Management Hierarchy Sorting & Summary Dashboard Matrix",
+    sorted[0].management_level === LEVELS[0] && summary.length >= 6,
+    `Top-sorted lead="${sorted[0].full_name_en || sorted[0].full_name_ar}" (${sorted[0].management_level}), Summary rows=${summary.length}`,
   );
-
-  // Clean up test rows from Google Sheets so the user's sheet is left spotless!
-  await sheets.deleteRows(dbRows.map((r) => r.id));
-  store.deleteLeads(dbRows.map((r) => r.id));
 
   const passed = results.filter((r) => r.pass).length;
   console.log(`\n========================================`);

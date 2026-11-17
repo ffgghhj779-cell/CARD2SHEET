@@ -195,9 +195,11 @@ export default function Home() {
       {batches.flat().map((l) => (
         <div className="card lead" key={`${l.id}-${l.scanned_at}`}>
           <h3 dir="auto">{[l.full_name_ar, l.full_name_en].filter(Boolean).join(" / ") || "—"}</h3>
-          <span className={`badge ${l.isNew ? "" : "dup"}`}>{l.isNew ? "new" : "duplicate – skipped"}</span>
+          <span className={`badge ${l.isNew ? "" : "dup"}`}>{l.isNew ? "new" : "duplicate – updated"}</span>
+          {l.decision_maker === "نعم" && <span className="badge" style={{ marginLeft: 6 }}>⭐ صانع قرار</span>}
           <p dir="auto">🏢 {l.company_name || "—"}</p>
-          <p dir="auto">🏷 {l.industry_category}</p>
+          <p dir="auto">📂 {l.sector}{l.industry_category && l.industry_category !== l.sector ? ` — ${l.industry_category}` : ""}</p>
+          <p dir="auto">🏛 {l.management_level}{l.department && l.department !== "غير محدد" ? ` | ${l.department}` : ""}</p>
           {l.job_title && <p dir="auto">💼 {l.job_title}</p>}
           {(l.primary_phone || l.secondary_phones) && (
             <p dir="ltr">📞 {[l.primary_phone, l.secondary_phones].filter(Boolean).join(" | ")}</p>

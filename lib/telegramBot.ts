@@ -3,14 +3,15 @@ import { buildXlsx } from "./exporter";
 import { prepareImage } from "./imagePrep";
 import * as svc from "./service";
 import * as store from "./store";
+import { LEVELS } from "./taxonomy";
 import type { Row } from "./types";
-import { analyzeText, extractLeads, transcribe } from "./vision";
+import { analyzeText, extractLeads, transcribe, type SearchFilters } from "./vision";
 
-const MEMORY_WINDOW_MS = 30 * 60 * 1000; // follow-up text/voice attaches to the last scan within 30 min
+const MEMORY_WINDOW_MS = 30 * 60 * 1000;
 const TG_LIMIT = 3900;
 
 export interface Transport {
-  send(chatId: number, text: string, replyTo?: number): Promise<number | undefined>; // returns message_id
+  send(chatId: number, text: string, replyTo?: number): Promise<number | undefined>;
   sendDocument(chatId: number, buf: Buffer, filename: string, caption: string): Promise<void>;
   download(fileId: string): Promise<Buffer>;
   typing(chatId: number): Promise<void>;
@@ -19,8 +20,14 @@ export interface Transport {
 // ---------------- formatting ----------------
 export function fmtRow(row: Row, tag = ""): string {
   const name = [row.full_name_ar, row.full_name_en].filter(Boolean).join(" / ") || "—";
-  const lines = [`${tag}👤 ${name}`.trim(), `🏢 ${row.company_name || "—"}`, `🏷 ${row.industry_category || "—"}`];
-  if (row.job_title) lines.push(`💼 ${row.job_title}`);
+  const dmBadge = row.decision_maker === "نعم" ? " ⭐ (صانع قرار)" : "";
+  const lines = [
+    `${tag}👤 ${name}${dmBadge}`.trim(),
+    `🏢 ${row.company_name || "—"}`,
+    `📂 القطاع (الشيت): ${row.sector || "—"}${row.industry_category && row.industry_category !== row.sector ? ` — ${row.industry_category}` : ""}`,
+    `🏛 الهيكل الإداري: ${row.management_level || "—"}${row.department && row.department !== "غير محدد" ? ` | ${row.department}` : ""}`,
+  ];
+  if (row.job_title) lines.push(`💼 المسمى: ${row.job_title}`);
   const phones = [row.primary_phone, row.secondary_phones].filter(Boolean).join(" | ");
   if (phones) lines.push(`📞 ${phones}`);
   if (row.email) lines.push(`✉️ ${row.email}`);
@@ -47,18 +54,32 @@ function chunks(blocks: string[], header = "", footer = ""): string[] {
   return out;
 }
 
-const sheetLine = (s: svc.SheetStatus) =>
-  s === "ok" ? "📊 Google Sheets ✔" : "⚠️ اتحفظ محلياً، والشيت هيتحدث أول ما النت يرجع (أو اكتب /sync)";
+const sheetLine = (s: svc.SheetStatus, sectors: string[] = []) => {
+  const tabs = [...new Set(sectors.filter(Boolean))];
+  const tabsInfo = tabs.length ? ` (صفحة: ${tabs.join("، ")})` : "";
+  return s === "ok"
+    ? `📊 تم الحفظ في شيت جوجل${tabsInfo} ✔`
+    : "⚠️ اتحفظ محلياً، والشيت هيتحدث أول ما النت يرجع (أو اكتب /sync)";
+};
 
 const HELP =
-  "📇 *بوت تسجيل العملاء من المعارض*\n\n" +
-  "📷 ابعت صورة كرت / بادج / بروشور (ممكن كذا كرت في صورة واحدة). للدقة القصوى ابعتها كـ *File*.\n" +
-  "📝 اكتب ملاحظة مع الصورة (Caption) أو بعدها مباشرة كرسالة.\n" +
-  "🎤 ابعت Voice Note بعد الصورة وهتتفرغ وتتضاف للملاحظات.\n" +
-  "↩️ اعمل Reply على رسالة أي عميل عشان تضيف له ملاحظة أو تصحح بياناته (مثال: الإيميل الصح ali@x.com).\n" +
-  "✍️ أو الصق بيانات عميل كنص وهتتسجل كعميل جديد.\n" +
-  "🔎 اسأل عن أي عميل: (مين من شركة سدرة؟) أو /find سدرة\n\n" +
-  "الأوامر:\n/export – ملف Excel\n/last – آخر عملاء اتسجلوا\n/find – بحث\n/undo – حذف آخر مسح\n/stats – إحصائيات\n/sync – مزامنة الشيت";
+  "📇 *بوت تسجيل وتصنيف العملاء من المعارض*\n\n" +
+  "📷 ابعت صورة كرت أو بادج أو بروشور (ممكن كذا كرت في صورة واحدة).\n" +
+  "📂 البوت يصنّف كل كرت تلقائياً حسب *القطاع* و*المستوى الإداري* و*الإدارة* و*صانع القرار*، ويفتح لكل قطاع شيت مستقل مرتب من الإدارة العليا للأقل.\n" +
+  "📝 اكتب ملاحظة مع الصورة أو بعدها مباشرة كرسالة.\n" +
+  "🎤 ابعت بصمة صوتية بعد الصورة وهتتفرغ وتتضاف للملاحظات.\n" +
+  "↩️ اعمل رد على رسالة أي عميل عشان تضيف له ملاحظة أو تصحح بياناته أو تغير قطاعه.\n" +
+  "✍️ أو الصق بيانات عميل كنص وهتتسجل كعميل جديد في شيت قطاعه.\n" +
+  "🔎 اسأل عن أي عميل أو قطاع أو مستوى إداري (مثال: مين صناع القرار في المقاولات؟).\n\n" +
+  "الأوامر:\n" +
+  "/export – ملف إكسيل مقسم بشيت لكل قطاع + ملخص\n" +
+  "/sectors – عرض القطاعات المفتوحة وعدد عملاء كل قطاع\n" +
+  "/stats – إحصائيات القطاعات والهيكل الإداري\n" +
+  "/last – آخر عملاء اتسجلوا\n" +
+  "/find – بحث\n" +
+  "/undo – حذف آخر مسح\n" +
+  "/sync – مزامنة الشيت\n" +
+  "/rebuild – إعادة بناء وتنظيم كل صفحات الشيت";
 
 // ---------------- bot ----------------
 export function createBot(t: Transport) {
@@ -70,7 +91,6 @@ export function createBot(t: Transport) {
 
   async function sendLeads(chatId: number, header: string, rows: { row: Row; tag: string }[], footer: string, replyTo?: number) {
     const ids = rows.map((r) => r.row.id);
-    // one message per lead when several => each one can be replied-to individually
     if (rows.length === 1) {
       await reply(chatId, chunks([fmtRow(rows[0].row, rows[0].tag)], header, footer).join("\n"), replyTo, ids);
       return;
@@ -80,7 +100,6 @@ export function createBot(t: Transport) {
     if (footer.trim()) await reply(chatId, footer.trim(), undefined, ids);
   }
 
-  /** Resolve which leads a follow-up refers to: reply-to message > last scan (memory window). */
   function targetIds(msg: TgMessage, userId: number): number[] | null {
     const rt = msg.reply_to_message?.message_id;
     if (rt) {
@@ -98,7 +117,7 @@ export function createBot(t: Transport) {
     const raw = await t.download(fileId);
     const leads = await extractLeads(await prepareImage(raw));
     if (!leads.length) {
-      await reply(chatId, "⚠️ ملقتش بيانات تواصل واضحة في الصورة.\nقرّب الكاميرا، خلي الإضاءة كويسة، أو ابعتها كـ File للجودة الكاملة.", msg.message_id);
+      await reply(chatId, "⚠️ ملقتش بيانات تواصل واضحة في الصورة.\nقرّب الكاميرا، خلي الإضاءة كويسة، أو ابعتها كملف للجودة الكاملة.", msg.message_id);
       return;
     }
     const caption = (msg.caption ?? "").trim();
@@ -106,10 +125,10 @@ export function createBot(t: Transport) {
 
     const { results, ids, sheet } = await svc.saveLeads(leads, user);
     store.setLastScan(userId, ids);
-    store.mapMessage(chatId, msg.message_id, ids); // replying to the photo itself also works
+    store.mapMessage(chatId, msg.message_id, ids);
     const nNew = results.filter((r) => r.isNew).length;
-    const header = `✅ تم استخراج ${results.length} سجل` + (nNew < results.length ? ` (${results.length - nNew} موجود قبل كده واتحدّث)` : "");
-    const footer = `\n\n${sheetLine(sheet)}` + (caption ? "" : "\n🎤 ابعت Voice Note أو اكتب ملاحظة دلوقتي وهتتضاف للعميل.");
+    const header = `✅ تم استخراج وتصنيف ${results.length} سجل` + (nNew < results.length ? ` (${results.length - nNew} موجود قبل كده واتحدّث)` : "");
+    const footer = `\n\n${sheetLine(sheet, results.map((r) => r.row.sector))}` + (caption ? "" : "\n🎤 ابعت بصمة صوتية أو اكتب ملاحظة دلوقتي وهتتضاف للعميل.");
     await sendLeads(
       chatId,
       header,
@@ -131,7 +150,6 @@ export function createBot(t: Transport) {
     const pick = (idx: number[]) => (idx.length ? idx.map((i) => recentRows[i].id) : recentRows.map((r) => r.id));
     const isReply = !!msg.reply_to_message && !!targets;
 
-    // a reply to a lead message is always about that lead (unless it's clearly a correction/search)
     const intent = isReply && (a.intent === "new_contact" || a.intent === "other") ? "note" : a.intent;
 
     if (intent === "new_contact" && a.leads.length) {
@@ -140,9 +158,9 @@ export function createBot(t: Transport) {
       store.setLastScan(userId, ids);
       await sendLeads(
         chatId,
-        `✍️ سجلت ${results.length} عميل من الرسالة`,
+        `✍️ سجلت وصنفت ${results.length} عميل من الرسالة`,
         results.map((r) => ({ row: r.row, tag: r.isNew ? "🆕 " : "♻️ (موجود واتحدّث) " })),
-        `\n\n${sheetLine(sheet)}`,
+        `\n\n${sheetLine(sheet, results.map((r) => r.row.sector))}`,
         msg.message_id,
       );
       return;
@@ -151,7 +169,7 @@ export function createBot(t: Transport) {
     if ((intent === "note" || intent === "correction") && !recentRows.length) {
       await reply(
         chatId,
-        "🤔 مش عارف الملاحظة دي تخص أنهي عميل.\nاعمل *Reply* على رسالة العميل وابعتها تاني، أو ابعت صورة الكرت الأول.\n\n" +
+        "🤔 مش عارف الملاحظة دي تخص أنهي عميل.\nاعمل رد على رسالة العميل وابعتها تاني، أو ابعت صورة الكرت الأول.\n\n" +
           (source === "Voice" ? `🎤 «${text}»` : ""),
         msg.message_id,
       );
@@ -164,7 +182,7 @@ export function createBot(t: Transport) {
       const { updated, sheet } = await svc.attachNote(ids, source === "Voice" ? "Voice" : "Note", note);
       store.touchLastScan(userId);
       const who = updated.map((r) => r.full_name_ar || r.full_name_en || r.company_name).join("، ");
-      await reply(chatId, `📝 اتضافت الملاحظة لـ: ${who}\n«${note}»\n\n${sheetLine(sheet)}`, msg.message_id, ids);
+      await reply(chatId, `📝 اتضافت الملاحظة لـ: ${who}\n«${note}»\n\n${sheetLine(sheet, updated.map((r) => r.sector))}`, msg.message_id, ids);
       return;
     }
 
@@ -174,24 +192,34 @@ export function createBot(t: Transport) {
       for (const c of a.corrections) fields[c.field] = c.value;
       const { updated, sheet } = await svc.applyCorrections(ids, fields);
       store.touchLastScan(userId);
-      await sendLeads(chatId, "✏️ اتعدّلت البيانات:", updated.map((row) => ({ row, tag: "" })), `\n\n${sheetLine(sheet)}`, msg.message_id);
+      await sendLeads(
+        chatId,
+        "✏️ اتعدّلت البيانات وتحدثت صفحات الشيت:",
+        updated.map((row) => ({ row, tag: "" })),
+        `\n\n${sheetLine(sheet, updated.map((r) => r.sector))}`,
+        msg.message_id,
+      );
       return;
     }
 
     if (intent === "search") {
-      return doFind(chatId, a.query || text, msg.message_id);
+      return doFind(chatId, a.query, a.filters, msg.message_id);
     }
 
     await reply(chatId, a.reply || HELP, msg.message_id);
   }
 
-  async function doFind(chatId: number, q: string, replyTo?: number) {
-    const rows = q.trim() ? store.search(q) : [];
+  async function doFind(chatId: number, q: string, filters?: SearchFilters, replyTo?: number) {
+    const hasFilter = filters && Object.values(filters).some(Boolean);
+    const rows = q.trim() || hasFilter ? store.search(q, 10, filters) : [];
+    const label = [q.trim(), filters?.sector, filters?.management_level, filters?.department, filters?.decision_maker === "نعم" ? "صناع القرار" : ""]
+      .filter(Boolean)
+      .join(" | ");
     if (!rows.length) {
-      await reply(chatId, `🔎 مفيش نتائج لـ «${q}»`, replyTo);
+      await reply(chatId, `🔎 مفيش نتائج لـ «${label || q}»`, replyTo);
       return;
     }
-    await sendLeads(chatId, `🔎 لقيت ${rows.length} نتيجة لـ «${q}»:`, rows.map((row) => ({ row, tag: "" })), "", replyTo);
+    await sendLeads(chatId, `🔎 لقيت ${rows.length} نتيجة لـ «${label || q}»:`, rows.map((row) => ({ row, tag: "" })), "", replyTo);
   }
 
   async function handleCommand(msg: TgMessage, cmd: string, arg: string, userId: number) {
@@ -206,21 +234,55 @@ export function createBot(t: Transport) {
         const d = new Date();
         const p = (n: number) => String(n).padStart(2, "0");
         const name = `leads_${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}_${p(d.getHours())}${p(d.getMinutes())}.xlsx`;
-        return void (await t.sendDocument(chatId, xlsx, name, `📥 إجمالي السجلات: ${store.allRows().length}`));
+        const sectorsCount = store.sectorsInUse().length;
+        return void (await t.sendDocument(chatId, xlsx, name, `📥 إجمالي العملاء: ${store.allRows().length} | عدد صفحات القطاعات: ${sectorsCount}`));
+      }
+      case "/sectors": {
+        const rows = store.allRows();
+        if (!rows.length) return void (await reply(chatId, "لسه مفيش عملاء متسجلين."));
+        const bySector = new Map<string, { total: number; dm: number }>();
+        for (const r of rows) {
+          const s = r.sector || "أخرى";
+          const cur = bySector.get(s) ?? { total: 0, dm: 0 };
+          cur.total++;
+          if (r.decision_maker === "نعم") cur.dm++;
+          bySector.set(s, cur);
+        }
+        const list = [...bySector.entries()]
+          .sort((a, b) => b[1].total - a[1].total)
+          .map(([s, v], i) => `${i + 1}. 📂 *${s}*: ${v.total} عميل (منهم ${v.dm} صانع قرار ⭐)`)
+          .join("\n");
+        return void (await reply(chatId, `🗂 *صفحات القطاعات المفتوحة في الشيت (${bySector.size} قطاع):*\n\n${list}`));
       }
       case "/stats": {
         const rows = store.allRows();
-        const by = new Map<string, number>();
-        rows.forEach((r) => by.set(r.industry_category || "—", (by.get(r.industry_category || "—") ?? 0) + 1));
-        const top = [...by.entries()].sort((a, b) => b[1] - a[1]).slice(0, 8).map(([k, v]) => `• ${k}: ${v}`).join("\n");
+        const bySector = new Map<string, number>();
+        rows.forEach((r) => bySector.set(r.sector || "—", (bySector.get(r.sector || "—") ?? 0) + 1));
+        const topSectors = [...bySector.entries()].sort((a, b) => b[1] - a[1]).slice(0, 10).map(([k, v]) => `• ${k}: ${v}`).join("\n");
+        const byLevel = LEVELS.map((l) => `• ${l}: ${rows.filter((r) => r.management_level === l).length}`).join("\n");
+        const dmCount = rows.filter((r) => r.decision_maker === "نعم").length;
         const pending = rows.filter((r) => !r.synced).length + store.dirtyRows().length;
-        return void (await reply(chatId, `📊 إجمالي العملاء: ${rows.length}\n⏳ في انتظار المزامنة: ${pending}\n\nحسب القطاع:\n${top || "—"}`));
+        return void (await reply(
+          chatId,
+          `📊 *إجمالي العملاء:* ${rows.length}\n⭐ *صناع القرار:* ${dmCount}\n⏳ *في انتظار المزامنة:* ${pending}\n\n` +
+            `🏛 *حسب المستوى الإداري:*\n${byLevel}\n\n` +
+            `📂 *حسب القطاع (عدد الشيتات: ${bySector.size}):*\n${topSectors || "—"}`,
+        ));
       }
       case "/sync": {
         const r = await svc.syncAll();
         return void (await reply(
           chatId,
           !r.ok ? "❌ فشلت المزامنة – اتأكد من النت وصلاحيات الشيت." : !r.appended && !r.notes ? "✔ كله متزامن." : `✔ اتزامن ${r.appended} سجل جديد و ${r.notes} تحديث.`,
+        ));
+      }
+      case "/rebuild": {
+        await t.typing(chatId);
+        await svc.backfillClassification();
+        const ok = await svc.rebuildEverything();
+        return void (await reply(
+          chatId,
+          ok ? `✔ تم إعادة بناء وتنظيم كل صفحات الشيت (${store.sectorsInUse().length} قطاع + صفحة الملخص) بنجاح!` : "❌ تعذر إعادة بناء الشيت حالياً.",
         ));
       }
       case "/last": {
@@ -231,7 +293,7 @@ export function createBot(t: Transport) {
       }
       case "/find":
         if (!arg) return void (await reply(chatId, "اكتب كلمة البحث بعد الأمر، مثال: /find سدرة"));
-        return doFind(chatId, arg, msg.message_id);
+        return doFind(chatId, arg, undefined, msg.message_id);
       case "/undo": {
         const rt = msg.reply_to_message?.message_id;
         const ids = (rt && store.idsForMessage(chatId, rt)) || store.getLastScan(userId)?.ids;
@@ -239,7 +301,7 @@ export function createBot(t: Transport) {
         const names = store.getRows(ids).map((r) => r.full_name_ar || r.full_name_en || r.company_name).join("، ");
         const ok = await svc.removeLeads(ids);
         store.setLastScan(userId, []);
-        return void (await reply(chatId, `🗑 اتحذف: ${names}` + (ok ? "\n📊 واتشال من Google Sheets ✔" : "\n⚠️ اتحذف محلياً بس، احذفه من الشيت يدوي.")));
+        return void (await reply(chatId, `🗑 اتحذف: ${names}` + (ok ? "\n📊 واتشال من كل صفحات الشيت ✔" : "\n⚠️ اتحذف محلياً بس، احذفه من الشيت يدوي.")));
       }
       default:
         return void (await reply(chatId, "أمر غير معروف.\n\n" + HELP));
@@ -276,16 +338,16 @@ export function createBot(t: Transport) {
       if (text) return await handleText(msg, text, "Text", userId, user);
 
       if (msg.document?.mime_type === "application/pdf")
-        return void (await reply(chatId, "📄 ملفات PDF مش مدعومة لسه – خد Screenshot للصفحة وابعتها كصورة.", msg.message_id));
+        return void (await reply(chatId, "📄 ملفات PDF مش مدعومة لسه – خد لقطة شاشة للصفحة وابعتها كصورة.", msg.message_id));
       if (msg.contact) {
         const c = msg.contact;
         return await handleText(msg, `سجل جهة اتصال: ${[c.first_name, c.last_name].filter(Boolean).join(" ")} ${c.phone_number}`, "Text", userId, user);
       }
-      await reply(chatId, "🤷 النوع ده مش مدعوم. ابعت صورة كرت، نص، أو Voice Note.", msg.message_id);
+      await reply(chatId, "🤷 النوع ده مش مدعوم. ابعت صورة كرت، نص، أو بصمة صوتية.", msg.message_id);
     } catch (e) {
       console.error("bot error:", e);
       const m = e instanceof Error ? e.message : String(e);
-      const friendly = /HTTP 401/.test(m) ? "مفتاح OpenAI غير صالح." : /HTTP 429/.test(m) ? "ضغط على خدمة الذكاء الاصطناعي أو الرصيد خلص، جرب تاني بعد شوية." : "حصل خطأ مؤقت، جرب تاني.";
+      const friendly = /HTTP 401/.test(m) ? "مفتاح الذكاء الاصطناعي غير صالح." : /HTTP 429/.test(m) ? "ضغط على الخدمة، جرب تاني بعد ثواني." : "حصل خطأ مؤقت، جرب تاني.";
       await reply(chatId, `❌ ${friendly}`, msg.message_id);
     }
   }
@@ -310,7 +372,6 @@ export interface TgMessage {
   media_group_id?: string;
 }
 
-// ---------------- real Telegram transport + long polling ----------------
 const tgUrl = (m: string) => `https://api.telegram.org/bot${config.telegramToken}/${m}`;
 async function tgCall(method: string, body: Record<string, unknown>) {
   const res = await fetch(tgUrl(method), { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
@@ -321,7 +382,7 @@ export const telegramTransport: Transport = {
   async send(chatId, text, replyTo) {
     const base = { chat_id: chatId, text, ...(replyTo ? { reply_parameters: { message_id: replyTo, allow_sending_without_reply: true } } : {}) };
     let r = await tgCall("sendMessage", { ...base, parse_mode: "Markdown" });
-    if (!r.ok) r = await tgCall("sendMessage", base); // fallback if Markdown breaks on user data
+    if (!r.ok) r = await tgCall("sendMessage", base);
     return r.result?.message_id;
   },
   async sendDocument(chatId, buf, filename, caption) {
@@ -350,6 +411,8 @@ export function startTelegramBot() {
   g.__tgBotPolling = true;
   const bot = createBot(telegramTransport);
   console.log("🤖 Telegram bot polling…");
+  // Automatically classify any legacy leads and ensure sector tabs are built
+  svc.backfillClassification().catch((e) => console.error("backfill:", e));
   (async () => {
     let offset = 0;
     for (;;) {
